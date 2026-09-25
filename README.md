@@ -411,7 +411,7 @@ curl -X POST http://localhost:8000/api/power-evaluations \
 `POST /api/detector-power-evaluations` 在功率评估请求（起点、中心方向、折射率、顺序界面、观察线、半角、采样数、`s_fraction`）基础上增加**探测半宽** `detector_half_width`（正的有限值）与**分箱数** `bin_count`（1～1001），把观察线当作探测线，对透过功率做一维分箱沉积。该接口为即时计算，结果不写入数据库。
 
 - **有符号坐标**：观察线法线归一化后**逆时针旋转 90°** 得单位切向量 `t`（响应中回显为 `tangent`），命中坐标 `coordinate = (观察线交点 − 观察线给定点) · t`。
-- **探测区间与分箱**：探测区间为**闭区间** `[-detector_half_width, +detector_half_width]`（边界计入）；`bin_count` 个等宽分箱，`bin_width = 2·detector_half_width/bin_count`，分箱中心 `c_i = -detector_half_width + (i + 0.5)·bin_width`（首末中心各内缩半个箱宽）。
+- **探测区间与分箱**：探测区间为**闭区间** `[-detector_half_width, +detector_half_width]`（边界计入）；`bin_count` 个等宽分箱，`bin_width = detector_half_width·(2/bin_count)`，分箱中心 `c_i = detector_half_width·((i + 0.5)·2/bin_count − 1)`（首末中心各内缩半个箱宽）。箱宽、中心与相邻箱权重均按**归一化坐标** `u = s/detector_half_width`（探测区间恒为 `[-1, 1]`）计算，不经 `2·detector_half_width` 中间量：探测半宽很大（如 `1e308`）而数学箱宽仍可表示时，`bin_width`、分箱中心与各箱功率均为有限值；数学箱宽 `2·detector_half_width/bin_count` 本身不可表示（溢出为无穷，如 `detector_half_width=1e308、bin_count=1`）时返回 `422` 说明该参数组合。
 - **沉积规则**：仅**追迹完成（completed）、出射段前向命中观察线且坐标位于闭区间内**的光线参与沉积（`deposited = true`）。命中坐标在相邻分箱中心 `c_i`、`c_{i+1}` 之间时按**线性权重**分给两箱（`bin[i] += power·(c_{i+1} − s)/bin_width`，`bin[i+1] += power·(s − c_i)/bin_width`）；落在**首末中心之外但仍在探测范围内**时**全量计入边缘箱**，分配守恒、不丢边缘功率。
 - **功率口径**：每条光线入射功率为 1，`power = s_fraction·Ts + (1 − s_fraction)·Tp`（同功率评估，全反射或漏过界面记零功率）。`received_power` 为各箱功率之和（等于全部沉积光线的 `power` 之和）；`unreceived_power = total_input_power − received_power`，其中 `total_input_power` 恒等于采样光线数，未接收部分包含追迹失败、未命中观察线及落在探测区间之外的功率。
 
@@ -485,7 +485,7 @@ curl -X POST http://localhost:8000/api/detector-power-evaluations \
 - `hit_count`：追迹完成且前向命中观察线的光线数；`deposited_count`：其中坐标落入探测闭区间、实际参与沉积的光线数。
 - `received_power` / `unreceived_power`：接收总功率与未接收功率，二者之和恒等于 `total_input_power`（即 `ray_count`）。
 - `rays[]` 字段同功率评估，另含 `coordinate`（有符号命中坐标，无前向交点时为 `null`）与 `deposited`（是否参与沉积）。
-- 参数校验：`detector_half_width` 必须为正的有限值，`bin_count` 取值 1～1001，否则返回 `422`。
+- 参数校验：`detector_half_width` 必须为正的有限值，`bin_count` 取值 1～1001，否则返回 `422`；探测半宽与分箱数使数学箱宽 `2·detector_half_width/bin_count` 超出浮点有限范围（溢出为无穷）时同样返回 `422`，响应给出该参数组合的具体数值说明。
 
 ## 波前光程差评估
 

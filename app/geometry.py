@@ -198,44 +198,82 @@ def ray_transmittance(
     return t_s, t_p
 
 
+def detector_bin_layout(
+    half_width: float, bin_count: int
+) -> tuple[float, list[float], list[float]]:
+    """按归一化坐标计算探测分箱布局，返回 (物理箱宽, 归一化中心, 物理中心)。
+
+    归一化坐标 u = s / half_width，探测区间恒为 [-1, +1]，归一化箱宽
+    u_width = 2/bin_count，归一化中心 u_i = (i + 0.5)·u_width − 1。物理
+    箱宽 width = half_width·u_width 直接由半宽乘归一化箱宽得到，不经
+    2·half_width 这一中间量，避免半宽过大（如 1e308）时两倍半宽先溢出为
+    无穷；物理中心 c_i = half_width·u_i 同样由半宽乘归一化中心得到。
+
+    数学箱宽 2·half_width/bin_count 不可表示（溢出为无穷）时抛出
+    ValueError：此时连唯一中心为 0 的单箱布局都无法给出有限箱宽，调用方
+    应按参数组合非法处理。
+    """
+    u_width = 2.0 / bin_count
+    width = half_width * u_width
+    if not math.isfinite(width):
+        raise ValueError(
+            f"探测半宽 {half_width} 与分箱数 {bin_count} 的组合使数学箱宽 "
+            f"2·detector_half_width/bin_count={2.0 * half_width / bin_count} "
+            "不可表示（超出浮点有限范围），请减小探测半宽或增大分箱数"
+        )
+    u_centers = [(i + 0.5) * u_width - 1.0 for i in range(bin_count)]
+    centers = [half_width * u for u in u_centers]
+    return width, u_centers, centers
+
+
 def power_binning(
     hits: list[tuple[float, float]],
     half_width: float,
     bin_count: int,
-) -> tuple[list[float], list[float]]:
+) -> tuple[list[float], list[float], float]:
     """将命中功率按有符号坐标在相邻分箱中心间线性分配（边缘截断，不丢功率）。
 
     探测区间为闭区间 [-half_width, +half_width]，bin_count 个分箱等宽
-    （宽度 width = 2·half_width/bin_count），分箱中心
-    c_i = -half_width + (i + 0.5)·width（i = 0..bin_count-1），
+    （物理箱宽 width = half_width·(2/bin_count)），物理分箱中心
+    c_i = half_width·((i + 0.5)·2/bin_count − 1)（i = 0..bin_count-1），
     首末中心分别内缩半个箱宽。
 
+    所有几何量都在归一化坐标 u = s/half_width（探测区间恒为 [-1, 1]）下
+    计算：物理箱宽与中心由半宽乘归一化量直接得到，不经 2·half_width
+    中间量，故半宽很大（如 1e308）而箱宽仍可表示时，箱宽、中心与权重
+    全部有限（如 half_width=1e308、bin_count=2 时中心为 ±5e307、箱宽
+    1e308，坐标 0 的命中在两箱间对半分配）。数学箱宽本身不可表示（溢出
+    为无穷，如 half_width=1e308、bin_count=1）时抛出 ValueError，由
+    调用方返回 422。
+
     每条命中 (coordinate, power)（坐标须已在闭区间内）：
-    - 坐标位于相邻中心 c_i 与 c_{i+1} 之间时按线性权重分配：
-      bin[i] += power·(c_{i+1} - s)/width，bin[i+1] += power·(s - c_i)/width；
+    - 坐标位于相邻中心 c_i 与 c_{i+1} 之间时按线性权重分配（归一化坐标
+      下与物理坐标数学等价，箱宽因子约去）：
+      bin[i] += power·(u_{i+1} - u)/u_width，bin[i+1] += power·(u - u_i)/u_width；
     - 坐标落在首中心左侧（或末中心右侧）但仍在探测区间内时，power 全额计入
       首箱（或末箱），避免边缘功率丢失。
 
     分配守恒：每条命中分出的功率之和等于其 power，故 sum(bins) 等于全部
     命中功率之和。bin_count 为 1 时唯一分箱中心在 0，区间内功率全部入该箱。
-    返回 (分箱中心列表, 各箱功率列表)。
+    返回 (物理分箱中心列表, 各箱功率列表, 物理箱宽)。
     """
-    width = 2.0 * half_width / bin_count
-    centers = [-half_width + (i + 0.5) * width for i in range(bin_count)]
+    width, u_centers, centers = detector_bin_layout(half_width, bin_count)
+    u_width = 2.0 / bin_count
     bins = [0.0] * bin_count
     for s, power in hits:
-        if s <= centers[0]:
+        u = s / half_width  # 归一化坐标：闭区间命中恒有 u ∈ [-1, 1]
+        if u <= u_centers[0]:
             bins[0] += power  # 首中心左侧（含恰在首中心）：全额入首箱
-        elif s >= centers[-1]:
+        elif u >= u_centers[-1]:
             bins[-1] += power  # 末中心右侧（含恰在末中心）：全额入末箱
         else:
-            i = int((s - centers[0]) / width)
+            i = int((u - u_centers[0]) / u_width)
             if i >= bin_count - 1:
-                i = bin_count - 2  # 浮点兜底：s 紧贴末中心时仍取末段间隔
-            frac = (s - centers[i]) / width
+                i = bin_count - 2  # 浮点兜底：u 紧贴末中心时仍取末段间隔
+            frac = (u - u_centers[i]) / u_width
             bins[i] += power * (1.0 - frac)
             bins[i + 1] += power * frac
-    return centers, bins
+    return centers, bins, width
 
 
 def sample_directions(

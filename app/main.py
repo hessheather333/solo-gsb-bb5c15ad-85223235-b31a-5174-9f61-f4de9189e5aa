@@ -53,6 +53,7 @@ from .geometry import (
     alignment_sensitivities,
     cauchy_refractive_index,
     centroid_and_rms,
+    detector_bin_layout,
     focus_search,
     linear_least_squares,
     normalize,
@@ -384,9 +385,14 @@ def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
 
     观察线即探测线：其法线归一化后逆时针旋转 90° 得单位切向量 t，命中坐标
     s = (观察线交点 − 观察线给定点) · t 为有符号坐标；探测区间为闭区间
-    [-detector_half_width, +detector_half_width]，bin_count 个等宽分箱，中心
-    c_i = -detector_half_width + (i + 0.5)·bin_width，bin_width =
-    2·detector_half_width/bin_count。
+    [-detector_half_width, +detector_half_width]，bin_count 个等宽分箱，
+    bin_width = detector_half_width·(2/bin_count)，中心 c_i =
+    detector_half_width·((i + 0.5)·2/bin_count − 1)。箱宽、中心与相邻箱
+    权重均在归一化坐标 u = s/detector_half_width（探测区间恒为 [-1, 1]）
+    下计算，不经 2·detector_half_width 中间量，故探测半宽很大（如 1e308）
+    而数学箱宽仍可表示时，bin_width、分箱中心与各箱功率均为有限值；数学
+    箱宽 2·detector_half_width/bin_count 本身不可表示（溢出为无穷）时
+    返回 422 说明该参数组合。
 
     每条采样光线的透过功率沿用功率评估（每条入射功率为 1，power =
     s_fraction·Ts + (1−s_fraction)·Tp，全反射或漏过界面记零功率）。仅追迹
@@ -406,6 +412,16 @@ def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
     obs_normal = req.observation_line.normal.as_tuple()
     nrm = normalize(obs_normal)
     tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+
+    # 先校验分箱布局：箱宽与中心按归一化坐标计算（见 power_binning），
+    # 数学箱宽 2·detector_half_width/bin_count 不可表示（溢出为无穷）时
+    # 以 422 说明参数组合，先于采样与追迹失败返回
+    try:
+        bin_width, _u_centers, _centers = detector_bin_layout(
+            req.detector_half_width, req.bin_count
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     rays_out: list[dict] = []
     deposited_hits: list[tuple[float, float]] = []  # 参与沉积的 (坐标, 功率)
@@ -455,10 +471,9 @@ def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
             }
         )
 
-    centers, bin_powers = power_binning(
+    centers, bin_powers, bin_width = power_binning(
         deposited_hits, req.detector_half_width, req.bin_count
     )
-    bin_width = 2.0 * req.detector_half_width / req.bin_count
     received_power = sum(bin_powers)
     total_input_power = float(len(rays_out))
     return {
