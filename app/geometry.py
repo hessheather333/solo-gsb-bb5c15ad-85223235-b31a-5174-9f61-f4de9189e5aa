@@ -198,6 +198,59 @@ def ray_transmittance(
     return t_s, t_p
 
 
+class DetectorBinOverflowError(ValueError):
+    """探测半宽与分箱数组合使数学箱宽不可表示（2·half_width/bin_count 为无穷）。
+
+    half_width 本身为有限值，但 2·half_width/bin_count 超出双精度浮点上界
+    （为正无穷），任何有限箱宽与分箱中心都无法表示；bin_count≥2 时箱宽按
+    half_width·(2/bin_count) 计算，只要数学结果不超上界即不会溢出（故实际
+    触发只发生在 bin_count=1 且 half_width >~8.99e307 使 2·half_width 为无穷）。
+    """
+
+
+def _detector_bin_layout(
+    half_width: float, bin_count: int
+) -> tuple[float, list[float], list[float]]:
+    """计算探测分箱的物理箱宽、归一化中心与物理中心；箱宽不可表示时抛错。
+
+    全部几何先在归一化坐标 u = s/half_width（探测区间映为 [-1, +1]）内完成：
+    归一化箱宽恒为 2/bin_count（bin_count≥1 均为有限值），归一化中心
+    u_i = -1 + (i + 0.5)·2/bin_count，不经过会溢出为无穷的 2·half_width；
+    物理中心最后由 c_i = u_i·half_width 换回（|u_i| ≤ 1 且 half_width 有限，
+    故必为有限值）。物理箱宽 width = 2·half_width/bin_count：bin_count≥2 时
+    按 half_width·(2/bin_count) 计算以避开 2·half_width 溢出（数学上恒等），
+    bin_count=1 时即 2·half_width，溢出为无穷说明该参数组合无法构造有限分箱，
+    抛 DetectorBinOverflowError（下溢为零不抛错：半宽为正的极小可表示值时
+    归一化坐标上的权重与箱功率仍良定义）。返回 (物理箱宽, 归一化中心, 物理中心)。
+    """
+    step = 2.0 / bin_count  # 归一化箱宽，bin_count≥1 时必为有限正值
+    if bin_count == 1:
+        width = 2.0 * half_width
+    else:
+        width = half_width * step  # 与 2·half_width/bin_count 数学恒等，先除后乘不溢出
+    if math.isinf(width):
+        raise DetectorBinOverflowError(
+            f"数学箱宽 2·detector_half_width/bin_count = 2·{half_width}/"
+            f"{bin_count} 超出双精度浮点可表示范围（为无穷），无法构造有限"
+            "分箱中心与箱宽；请减小 detector_half_width 或增大 bin_count"
+        )
+    u_centers = [-1.0 + (i + 0.5) * step for i in range(bin_count)]
+    centers = [u * half_width for u in u_centers]
+    return width, u_centers, centers
+
+
+def detector_bin_layout(
+    half_width: float, bin_count: int
+) -> tuple[float, list[float]]:
+    """探测分箱的物理箱宽与各箱物理中心；箱宽不可表示时抛 DetectorBinOverflowError。
+
+    供 API 层在追迹前校验参数组合（见 _detector_bin_layout：归一化坐标计算，
+    箱宽溢出为无穷时抛 DetectorBinOverflowError）。返回 (箱宽, 分箱中心列表)。
+    """
+    width, _u_centers, centers = _detector_bin_layout(half_width, bin_count)
+    return width, centers
+
+
 def power_binning(
     hits: list[tuple[float, float]],
     half_width: float,
@@ -210,9 +263,17 @@ def power_binning(
     c_i = -half_width + (i + 0.5)·width（i = 0..bin_count-1），
     首末中心分别内缩半个箱宽。
 
+    几何量一律在归一化坐标 u = s/half_width（探测区间映为 [-1, +1]）内计算
+    （见 _detector_bin_layout）：归一化箱宽恒为 2/bin_count，不经过会溢出的
+    2·half_width，故 half_width 接近双精度上界（如 1e308、bin_count=2）时箱宽、
+    中心与权重仍为有限值；物理中心最后由 u_i·half_width 换回。数学箱宽本身
+    不可表示（bin_count=1 且 half_width 过大使 2·half_width 溢出）时抛
+    DetectorBinOverflowError。
+
     每条命中 (coordinate, power)（坐标须已在闭区间内）：
     - 坐标位于相邻中心 c_i 与 c_{i+1} 之间时按线性权重分配：
-      bin[i] += power·(c_{i+1} - s)/width，bin[i+1] += power·(s - c_i)/width；
+      bin[i] += power·(c_{i+1} - s)/width，bin[i+1] += power·(s - c_i)/width
+      （实现中权重为归一化坐标上的等价值，比值与物理坐标严格相同）；
     - 坐标落在首中心左侧（或末中心右侧）但仍在探测区间内时，power 全额计入
       首箱（或末箱），避免边缘功率丢失。
 
@@ -220,19 +281,20 @@ def power_binning(
     命中功率之和。bin_count 为 1 时唯一分箱中心在 0，区间内功率全部入该箱。
     返回 (分箱中心列表, 各箱功率列表)。
     """
-    width = 2.0 * half_width / bin_count
-    centers = [-half_width + (i + 0.5) * width for i in range(bin_count)]
+    _width, u_centers, centers = _detector_bin_layout(half_width, bin_count)
+    u_width = 2.0 / bin_count  # 归一化箱宽
     bins = [0.0] * bin_count
     for s, power in hits:
-        if s <= centers[0]:
+        u = s / half_width  # 归一化命中坐标，[-1, +1] 内
+        if u <= u_centers[0]:
             bins[0] += power  # 首中心左侧（含恰在首中心）：全额入首箱
-        elif s >= centers[-1]:
+        elif u >= u_centers[-1]:
             bins[-1] += power  # 末中心右侧（含恰在末中心）：全额入末箱
         else:
-            i = int((s - centers[0]) / width)
+            i = int((u - u_centers[0]) / u_width)
             if i >= bin_count - 1:
-                i = bin_count - 2  # 浮点兜底：s 紧贴末中心时仍取末段间隔
-            frac = (s - centers[i]) / width
+                i = bin_count - 2  # 浮点兜底：u 紧贴末中心时仍取末段间隔
+            frac = (u - u_centers[i]) / u_width
             bins[i] += power * (1.0 - frac)
             bins[i + 1] += power * frac
     return centers, bins

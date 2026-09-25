@@ -53,6 +53,8 @@ from .geometry import (
     alignment_sensitivities,
     cauchy_refractive_index,
     centroid_and_rms,
+    detector_bin_layout,
+    DetectorBinOverflowError,
     focus_search,
     linear_least_squares,
     normalize,
@@ -395,7 +397,11 @@ def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
     但仍在探测范围内时全量计入边缘箱，分配守恒不丢边缘功率。接收总功率
     received_power 为各箱功率之和；未接收功率 unreceived_power = 采样光线数
     （即入射总功率，每条入射功率为 1）− 接收总功率，包含追迹失败、未命中
-    观察线与落在探测区间之外的功率。该接口为即时计算，结果不写入数据库。
+    观察线与落在探测区间之外的功率。分箱几何在归一化坐标下计算（见
+    power_binning），detector_half_width 接近双精度上界时箱宽、中心与功率
+    仍为有限值；仅当数学箱宽 2·detector_half_width/bin_count 本身不可表示
+    （溢出为无穷，如 bin_count=1 且半宽 >~8.99e307）时返回 422 并说明参数
+    组合。该接口为即时计算，结果不写入数据库。
     """
     interfaces = [
         (itf.point.as_tuple(), itf.normal.as_tuple(), itf.n_next)
@@ -406,6 +412,14 @@ def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
     obs_normal = req.observation_line.normal.as_tuple()
     nrm = normalize(obs_normal)
     tangent = (-nrm[1], nrm[0])  # 法线逆时针旋转 90° 得单位切向量
+
+    # 追迹前先校验分箱几何：数学箱宽不可表示（溢出）时直接 422
+    try:
+        bin_width, bin_centers = detector_bin_layout(
+            req.detector_half_width, req.bin_count
+        )
+    except DetectorBinOverflowError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
     rays_out: list[dict] = []
     deposited_hits: list[tuple[float, float]] = []  # 参与沉积的 (坐标, 功率)
@@ -455,10 +469,9 @@ def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
             }
         )
 
-    centers, bin_powers = power_binning(
+    _centers, bin_powers = power_binning(
         deposited_hits, req.detector_half_width, req.bin_count
-    )
-    bin_width = 2.0 * req.detector_half_width / req.bin_count
+    )  # 分箱几何已由上方 detector_bin_layout 校验通过（箱宽不可表示时已 422）
     received_power = sum(bin_powers)
     total_input_power = float(len(rays_out))
     return {
@@ -477,7 +490,7 @@ def evaluate_detector_power(req: DetectorPowerRequest) -> dict:
         "unreceived_power": total_input_power - received_power,
         "bins": [
             {"index": i, "center": center, "power": power}
-            for i, (center, power) in enumerate(zip(centers, bin_powers))
+            for i, (center, power) in enumerate(zip(bin_centers, bin_powers))
         ],
         "rays": rays_out,
     }

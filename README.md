@@ -485,7 +485,7 @@ curl -X POST http://localhost:8000/api/detector-power-evaluations \
 - `hit_count`：追迹完成且前向命中观察线的光线数；`deposited_count`：其中坐标落入探测闭区间、实际参与沉积的光线数。
 - `received_power` / `unreceived_power`：接收总功率与未接收功率，二者之和恒等于 `total_input_power`（即 `ray_count`）。
 - `rays[]` 字段同功率评估，另含 `coordinate`（有符号命中坐标，无前向交点时为 `null`）与 `deposited`（是否参与沉积）。
-- 参数校验：`detector_half_width` 必须为正的有限值，`bin_count` 取值 1～1001，否则返回 `422`。
+- 参数校验：`detector_half_width` 必须为正的有限值，`bin_count` 取值 1～1001，否则返回 `422`。分箱几何在归一化坐标（`u = s/detector_half_width`，区间映为 `[-1, 1]`）下计算，故 `detector_half_width` 接近双精度上界（如 `1e308`、`bin_count=2`）时 `bin_width`、各箱 `center` 与 `power` 仍为有限值且分配守恒；仅当数学箱宽 `2·detector_half_width/bin_count` 本身超出双精度浮点范围（如 `bin_count=1` 且半宽大于约 `8.99e307`，`2·半宽` 溢出为无穷）时返回 `422` 并在 `detail` 中说明该参数组合无法构造有限分箱。
 
 ## 波前光程差评估
 
